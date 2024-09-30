@@ -7,8 +7,6 @@ const mem = std.mem;
 
 const STDIN = io.getStdIn().reader();
 const STDOUT = io.getStdOut().writer();
-const STDIN_FILENO = linux.STDIN_FILENO;
-const STDOUT_FILENO = linux.STDOUT_FILENO;
 
 const Key = enum(u8) { ctrl_q = 17, _ };
 
@@ -33,7 +31,7 @@ const Editor = struct {
     }
 
     fn enableRawMode(self: *Self) !void {
-        _ = linux.tcgetattr(STDIN_FILENO, &self.orig_termios);
+        _ = linux.tcgetattr(linux.STDIN_FILENO, &self.orig_termios);
         var termios = self.orig_termios;
 
         // Terminal local flags disabled;
@@ -83,17 +81,17 @@ const Editor = struct {
         // Max amount of time, in tenths of a second, to wait before `read()` returns.
         termios.cc[VTIME] = 1;
 
-        _ = linux.tcsetattr(STDIN_FILENO, .FLUSH, &termios);
+        _ = linux.tcsetattr(linux.STDIN_FILENO, .FLUSH, &termios);
     }
 
     fn disableRawMode(self: *Self) void {
-        _ = linux.tcsetattr(STDIN_FILENO, .FLUSH, &self.orig_termios);
+        _ = linux.tcsetattr(linux.STDIN_FILENO, .FLUSH, &self.orig_termios);
     }
 
     fn readKey(self: *Self) !void {
         while (true) {
             // NOTE: VTIME is not being respected, `read` is hanging;
-            _ = linux.read(STDIN_FILENO, &self.c, 1);
+            _ = linux.read(linux.STDIN_FILENO, &self.c, 1);
             break;
         }
     }
@@ -133,12 +131,12 @@ const Editor = struct {
     fn getWindowSize(self: *Self) !void {
         var winsize: std.posix.winsize = undefined;
         if (linux.ioctl(
-            STDOUT_FILENO,
+            linux.STDOUT_FILENO,
             0x5413, // TIOCGWINSZ
             @intFromPtr(&winsize),
         ) == -1 or winsize.col == 0) {
             const strn = "\x1b[999C\x1b[999B";
-            _ = linux.write(STDOUT_FILENO, strn, strn.len);
+            _ = linux.write(linux.STDOUT_FILENO, strn, strn.len);
         } else {
             self.num_rows = winsize.row;
             self.num_cols = winsize.col;
