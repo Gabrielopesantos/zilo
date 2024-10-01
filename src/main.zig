@@ -4,9 +4,12 @@ const io = std.io;
 const linux = std.os.linux;
 const ascii = std.ascii;
 const mem = std.mem;
+const ArrayList = std.ArrayList;
 
 const STDIN = io.getStdIn().reader();
 const STDOUT = io.getStdOut().writer();
+
+const ZILO_VERSION = "0.0.1";
 
 const Key = enum(u8) { ctrl_q = 17, _ };
 
@@ -105,25 +108,37 @@ const Editor = struct {
     }
 
     fn refreshScreen(self: *Self) !void {
-        // Writting 4 bytes out to the terminal, `\x1b` (27) and `[2J`.
-        // Escape sequences always start with `Escape` followed by `[`
-        // We are using the J command (Erase In Display) to clear the screen.
-        // Escape sequence commands take arguments, which come before the command.
-        // In this case the argument is 2, which says to clear the entire screen
-        _ = try STDOUT.writeAll("\x1b[2J");
+        var ab = ArrayList(u8).init(self.allocator);
+        defer ab.deinit();
+        // Hide the cursor when repainting
+        try ab.appendSlice("\x1b[?25l");
+        // Escape sequences always start with `Escape` (\x1b or 27) followed by `[`
         // H command, which is only 3 bytes long, puts the cursor at a certain position (1, 1) by default;
-        _ = linux.write(linux.STDOUT_FILENO, "\x1b[H", 3);
-
-        try self.drawRows();
-
-        _ = linux.write(linux.STDOUT_FILENO, "\x1b[H", 3);
+        try ab.appendSlice("\x1b[H");
+        try self.drawRows(&ab);
+        try ab.appendSlice("\x1b[H");
+        try ab.appendSlice("\x1b[?25h");
+        _ = linux.write(linux.STDOUT_FILENO, ab.items.ptr, ab.items.len);
     }
 
-    fn drawRows(self: *Self) !void {
+    fn drawRows(self: *Self, ab: *ArrayList(u8)) !void {
         for (0..self.screenrows) |y| {
-            _ = try STDOUT.write("~");
+            if (y == self.screencols / 3) {
+                var buf: [64]u8 = undefined;
+                const welcome = try std.fmt.bufPrint(&buf, "Zilo editor -- version {s}", .{ZILO_VERSION});
+                var padding = if (welcome.len > self.screencols) 0 else (self.screencols - welcome.len) / 2;
+                if (padding > 0) {
+                    try ab.appendSlice("~");
+                    padding -= 1;
+                }
+                for (0..padding) |_| try ab.appendSlice(" ");
+                try ab.appendSlice(welcome);
+            } else {
+                try ab.appendSlice("~");
+            }
+            try ab.appendSlice("\x1b[K");
             if (y < self.screenrows - 1) {
-                _ = try STDOUT.write("\r\n");
+                try ab.appendSlice("\r\n");
             }
         }
     }
