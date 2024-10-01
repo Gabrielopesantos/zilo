@@ -16,8 +16,8 @@ const Editor = struct {
     allocator: mem.Allocator,
     c: [1]u8 = undefined,
     orig_termios: linux.termios = undefined,
-    num_rows: u16 = 0,
-    num_cols: u16 = 0,
+    screenrows: u16 = 0,
+    screencols: u16 = 0,
 
     fn init(allocator: mem.Allocator) !Self {
         return Self{
@@ -120,8 +120,11 @@ const Editor = struct {
     }
 
     fn drawRows(self: *Self) !void {
-        for (0..self.num_cols) |_| {
-            _ = try STDOUT.write("~\r\n");
+        for (0..self.screenrows) |y| {
+            _ = try STDOUT.write("~");
+            if (y < self.screenrows - 1) {
+                _ = try STDOUT.write("\r\n");
+            }
         }
     }
 
@@ -136,8 +139,8 @@ const Editor = struct {
             _ = linux.write(linux.STDOUT_FILENO, strn, strn.len);
             return try self.getCursorPosition();
         } else {
-            self.num_rows = winsize.row;
-            self.num_cols = winsize.col;
+            self.screenrows = winsize.row;
+            self.screencols = winsize.col;
         }
     }
 
@@ -155,8 +158,8 @@ const Editor = struct {
         if (buf[0] != '\x1b' or buf[1] != '[') return error.CursorError;
         // Format is follows \x1b[24;98R
         var buf_iter = std.mem.tokenizeAny(u8, buf[2..i], ";");
-        self.num_rows = try std.fmt.parseInt(u16, buf_iter.next() orelse return error.InvalidFormat, 10);
-        self.num_cols = try std.fmt.parseInt(u16, buf_iter.next() orelse return error.InvalidFormat, 10);
+        self.screenrows = try std.fmt.parseInt(u16, buf_iter.next() orelse return error.InvalidFormat, 10);
+        self.screencols = try std.fmt.parseInt(u16, buf_iter.next() orelse return error.InvalidFormat, 10);
     }
 };
 
