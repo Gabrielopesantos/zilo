@@ -89,11 +89,8 @@ const Editor = struct {
     }
 
     fn readKey(self: *Self) !void {
-        while (true) {
-            // NOTE: VTIME is not being respected, `read` is hanging;
-            _ = linux.read(linux.STDIN_FILENO, &self.c, 1);
-            break;
-        }
+        // NOTE: VTIME is not being respected, `read` is hanging;
+        _ = linux.read(linux.STDIN_FILENO, &self.c, 1);
     }
 
     fn processKeyPress(self: *Self) !void {
@@ -137,10 +134,29 @@ const Editor = struct {
         ) == -1 or winsize.col == 0) {
             const strn = "\x1b[999C\x1b[999B";
             _ = linux.write(linux.STDOUT_FILENO, strn, strn.len);
+            return try self.getCursorPosition();
         } else {
             self.num_rows = winsize.row;
             self.num_cols = winsize.col;
         }
+    }
+
+    fn getCursorPosition(self: *Self) !void {
+        var buf: [32]u8 = undefined;
+        var i: usize = 0;
+
+        const tmp = "\x1b[6n";
+        _ = linux.write(linux.STDOUT_FILENO, tmp, tmp.len);
+        while (i < buf.len - 1) {
+            _ = linux.read(linux.STDIN_FILENO, @as([*]u8, @ptrCast(&buf[i])), 1);
+            if (buf[i] == 'R') break;
+            i += 1;
+        }
+        if (buf[0] != '\x1b' or buf[1] != '[') return error.CursorError;
+        // Format is follows \x1b[24;98R
+        var buf_iter = std.mem.tokenizeAny(u8, buf[2..i], ";");
+        self.num_rows = try std.fmt.parseInt(u16, buf_iter.next() orelse return error.InvalidFormat, 10);
+        self.num_cols = try std.fmt.parseInt(u16, buf_iter.next() orelse return error.InvalidFormat, 10);
     }
 };
 
@@ -152,10 +168,9 @@ pub fn main() !void {
     var editor = try Editor.init(allocator);
     defer editor.deinit();
 
+    try editor.enableRawMode();
     // NOTE: Temporary
     try editor.getWindowSize();
-
-    try editor.enableRawMode();
     while (true) {
         try editor.refreshScreen();
         try editor.processKeyPress();
