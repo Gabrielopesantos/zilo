@@ -84,8 +84,10 @@ const Editor = struct {
         // Set read timeout
         // VMIN and VTIME are indices into the cc_field, which stands for `control characters`,
         // an array of bytes that control various terminal settings.
-        const VMIN = 5;
-        const VTIME = 6;
+        // #define VTIME 5
+        // #define VMIN 6
+        const VTIME = 5;
+        const VMIN = 6;
         // Min number of bytes of input needed before `read()` can return.
         termios.cc[VMIN] = 0;
         // Max amount of time, in tenths of a second, to wait before `read()` returns.
@@ -99,17 +101,13 @@ const Editor = struct {
     }
 
     fn readKey(self: *Self) !u8 {
-        // NOTE: VTIME is not being respected, `read` is hanging;
-        var bytes_read = linux.read(linux.STDIN_FILENO, self.c[0..1], 1);
-        if (bytes_read != 1) {
-            return error.ReadError;
+        _ = linux.read(linux.STDIN_FILENO, self.c[0..1], 1);
+        defer {
+            self.c = [_]u8{0} ** 4;
         }
         switch (@as(Key, @enumFromInt(self.c[0]))) {
             .esc => {
-                bytes_read = linux.read(linux.STDIN_FILENO, self.c[1..3], 2);
-                if (bytes_read != 2) {
-                    return error.ReadError;
-                }
+                _ = linux.read(linux.STDIN_FILENO, self.c[1..3], 2);
                 switch (self.c[1]) {
                     // 91
                     '[' => {
