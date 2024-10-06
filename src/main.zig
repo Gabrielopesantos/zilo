@@ -14,7 +14,6 @@ const ZILO_VERSION = "0.0.1";
 const Key = enum(u8) {
     ctrl_q = 17,
     esc = 27,
-    open_bracket = 91,
     arrow_up = 128,
     arrow_down,
     arrow_right,
@@ -34,10 +33,7 @@ const Editor = struct {
     cy: u16 = 0, // Vertical coordinate of the cursor (the row)
 
     fn init(allocator: mem.Allocator) !Self {
-        return Self{
-            .allocator = allocator,
-            .c = [_]u8{ 0, 0, 0, 0 },
-        };
+        return Self{ .allocator = allocator, .c = [_]u8{0} ** 4 };
     }
 
     fn deinit(self: *Self) void {
@@ -104,24 +100,32 @@ const Editor = struct {
 
     fn readKey(self: *Self) !u8 {
         // NOTE: VTIME is not being respected, `read` is hanging;
-        _ = linux.read(linux.STDIN_FILENO, self.c[0..1], 1);
+        var bytes_read = linux.read(linux.STDIN_FILENO, self.c[0..1], 1);
+        if (bytes_read != 1) {
+            return error.ReadError;
+        }
         switch (@as(Key, @enumFromInt(self.c[0]))) {
             .esc => {
-                _ = linux.read(linux.STDIN_FILENO, self.c[1..2], 1);
-                switch (@as(Key, @enumFromInt(self.c[1]))) {
-                    .open_bracket => {
-                        _ = linux.read(linux.STDIN_FILENO, self.c[2..3], 1);
+                bytes_read = linux.read(linux.STDIN_FILENO, self.c[1..3], 2);
+                if (bytes_read != 2) {
+                    return error.ReadError;
+                }
+                switch (self.c[1]) {
+                    // 91
+                    '[' => {
                         switch (self.c[2]) {
+                            // 65
                             'A' => return @intFromEnum(Key.arrow_up),
+                            // 66
                             'B' => return @intFromEnum(Key.arrow_down),
+                            // 67
                             'C' => return @intFromEnum(Key.arrow_right),
+                            // 68
                             'D' => return @intFromEnum(Key.arrow_left),
                             else => {},
                         }
                     },
-                    else => {
-                        return '4';
-                    },
+                    else => {},
                 }
             },
             else => {
@@ -133,14 +137,14 @@ const Editor = struct {
     }
 
     fn processKeyPress(self: *Self) !void {
-        const c = try self.readKey();
-        switch (@as(Key, @enumFromInt(c))) {
+        const k = try self.readKey();
+        switch (@as(Key, @enumFromInt(k))) {
             .ctrl_q => {
                 self.disableRawMode();
                 linux.exit(0);
             },
             .arrow_up, .arrow_down, .arrow_left, .arrow_right => {
-                try self.moveCursor(c);
+                try self.moveCursor(@as(Key, @enumFromInt(k)));
             },
             else => {},
         }
@@ -215,14 +219,14 @@ const Editor = struct {
             i += 1;
         }
         if (buf[0] != '\x1b' or buf[1] != '[') return error.CursorError;
-        // Format is follows \x1b[24;98R
+        // Format follows \x1b[24;98R
         var buf_iter = std.mem.tokenizeAny(u8, buf[2..i], ";");
         self.screenrows = try std.fmt.parseInt(u16, buf_iter.next() orelse return error.InvalidFormat, 10);
         self.screencols = try std.fmt.parseInt(u16, buf_iter.next() orelse return error.InvalidFormat, 10);
     }
 
-    fn moveCursor(self: *Self, c: u8) !void {
-        switch (@as(Key, @enumFromInt(c))) {
+    fn moveCursor(self: *Self, key: Key) !void {
+        switch (key) {
             .arrow_up => {
                 self.cx -= 1;
             },
