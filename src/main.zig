@@ -11,21 +11,32 @@ const STDOUT = io.getStdOut().writer();
 
 const ZILO_VERSION = "0.0.1";
 
-const Key = enum(u8) { ctrl_q = 17, _ };
+const Key = enum(u8) {
+    ctrl_q = 17,
+    esc = 27,
+    open_bracket = 91,
+    arrow_up = 128,
+    arrow_down,
+    arrow_right,
+    arrow_left,
+    _,
+};
 
 const Editor = struct {
     const Self = @This();
 
     allocator: mem.Allocator,
-    c: [1]u8 = undefined,
+    c: [4]u8 = undefined,
     orig_termios: linux.termios = undefined,
     screenrows: u16 = 0,
     screencols: u16 = 0,
+    cx: u16 = 0, // Horizontal coordinate of the cursor (the column)
+    cy: u16 = 0, // Vertical coordinate of the cursor (the row)
 
     fn init(allocator: mem.Allocator) !Self {
         return Self{
             .allocator = allocator,
-            .c = [_]u8{0},
+            .c = [_]u8{ 0, 0, 0, 0 },
         };
     }
 
@@ -91,17 +102,45 @@ const Editor = struct {
         _ = linux.tcsetattr(linux.STDIN_FILENO, .FLUSH, &self.orig_termios);
     }
 
-    fn readKey(self: *Self) !void {
+    fn readKey(self: *Self) !u8 {
         // NOTE: VTIME is not being respected, `read` is hanging;
-        _ = linux.read(linux.STDIN_FILENO, &self.c, 1);
+        _ = linux.read(linux.STDIN_FILENO, self.c[0..1], 1);
+        switch (@as(Key, @enumFromInt(self.c[0]))) {
+            .esc => {
+                _ = linux.read(linux.STDIN_FILENO, self.c[1..2], 1);
+                switch (@as(Key, @enumFromInt(self.c[1]))) {
+                    .open_bracket => {
+                        _ = linux.read(linux.STDIN_FILENO, self.c[2..3], 1);
+                        switch (self.c[2]) {
+                            'A' => return @intFromEnum(Key.arrow_up),
+                            'B' => return @intFromEnum(Key.arrow_down),
+                            'C' => return @intFromEnum(Key.arrow_right),
+                            'D' => return @intFromEnum(Key.arrow_left),
+                            else => {},
+                        }
+                    },
+                    else => {
+                        return '4';
+                    },
+                }
+            },
+            else => {
+                return self.c[0];
+            },
+        }
+
+        return self.c[0];
     }
 
     fn processKeyPress(self: *Self) !void {
-        try self.readKey();
-        switch (@as(Key, @enumFromInt(self.c[0]))) {
+        const c = try self.readKey();
+        switch (@as(Key, @enumFromInt(c))) {
             .ctrl_q => {
                 self.disableRawMode();
                 linux.exit(0);
+            },
+            .arrow_up, .arrow_down, .arrow_left, .arrow_right => {
+                try self.moveCursor(c);
             },
             else => {},
         }
@@ -116,7 +155,12 @@ const Editor = struct {
         // H command, which is only 3 bytes long, puts the cursor at a certain position (1, 1) by default;
         try ab.appendSlice("\x1b[H");
         try self.drawRows(&ab);
-        try ab.appendSlice("\x1b[H");
+
+        // Draw cursor on (`cx`, `cy`) position
+        var buf: [32]u8 = undefined;
+        _ = try std.fmt.bufPrint(&buf, "\x1b[{};{}H", .{ self.cx + 1, self.cy + 1 });
+        try ab.appendSlice(&buf);
+
         try ab.appendSlice("\x1b[?25h");
         _ = linux.write(linux.STDOUT_FILENO, ab.items.ptr, ab.items.len);
     }
@@ -175,6 +219,24 @@ const Editor = struct {
         var buf_iter = std.mem.tokenizeAny(u8, buf[2..i], ";");
         self.screenrows = try std.fmt.parseInt(u16, buf_iter.next() orelse return error.InvalidFormat, 10);
         self.screencols = try std.fmt.parseInt(u16, buf_iter.next() orelse return error.InvalidFormat, 10);
+    }
+
+    fn moveCursor(self: *Self, c: u8) !void {
+        switch (@as(Key, @enumFromInt(c))) {
+            .arrow_up => {
+                self.cx -= 1;
+            },
+            .arrow_down => {
+                self.cx += 1;
+            },
+            .arrow_right => {
+                self.cy += 1;
+            },
+            .arrow_left => {
+                self.cy -= 1;
+            },
+            else => unreachable,
+        }
     }
 };
 
