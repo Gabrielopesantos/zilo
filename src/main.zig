@@ -12,12 +12,17 @@ const STDOUT = io.getStdOut().writer();
 const ZILO_VERSION = "0.0.1";
 
 const Key = enum(u8) {
-    ctrl_q = 17,
-    esc = 27,
-    arrow_up = 128,
-    arrow_down,
-    arrow_right,
-    arrow_left,
+    CTRL_Q = 17,
+    ESC = 27,
+    ARROW_UP = 128,
+    ARROW_DOWN,
+    ARROW_RIGHT,
+    ARROW_LEFT,
+    HOME,
+    END,
+    DEL,
+    PAGE_UP,
+    PAGE_DOWN,
     _,
 };
 
@@ -25,7 +30,6 @@ const Editor = struct {
     const Self = @This();
 
     allocator: mem.Allocator,
-    c: [4]u8 = undefined,
     orig_termios: linux.termios = undefined,
     screenrows: u16 = 0,
     screencols: u16 = 0,
@@ -33,7 +37,7 @@ const Editor = struct {
     cy: u16 = 0, // Vertical coordinate of the cursor (the row)
 
     fn init(allocator: mem.Allocator) !Self {
-        return Self{ .allocator = allocator, .c = [_]u8{0} ** 4 };
+        return Self{ .allocator = allocator };
     }
 
     fn deinit(self: *Self) void {
@@ -100,26 +104,51 @@ const Editor = struct {
         _ = linux.tcsetattr(linux.STDIN_FILENO, .FLUSH, &self.orig_termios);
     }
 
-    fn readKey(self: *Self) !u8 {
-        _ = linux.read(linux.STDIN_FILENO, self.c[0..1], 1);
-        defer {
-            self.c = [_]u8{0} ** 4;
-        }
-        switch (@as(Key, @enumFromInt(self.c[0]))) {
-            .esc => {
-                _ = linux.read(linux.STDIN_FILENO, self.c[1..3], 2);
-                switch (self.c[1]) {
+    fn readKey(_: *Self) !u8 {
+        // var seq = try self.allocator.alloc(u8, 3);
+        // defer self.allocator.free(seq);
+        var seq = [_]u8{0} ** 4;
+        _ = linux.read(linux.STDIN_FILENO, seq[0..1], 1);
+        switch (@as(Key, @enumFromInt(seq[0]))) {
+            .ESC => {
+                _ = linux.read(linux.STDIN_FILENO, seq[1..2], 1);
+                switch (seq[1]) {
                     // 91
                     '[' => {
-                        switch (self.c[2]) {
+                        _ = linux.read(linux.STDIN_FILENO, seq[2..3], 1);
+                        switch (seq[2]) {
                             // 65
-                            'A' => return @intFromEnum(Key.arrow_up),
+                            'A' => return @intFromEnum(Key.ARROW_UP),
                             // 66
-                            'B' => return @intFromEnum(Key.arrow_down),
+                            'B' => return @intFromEnum(Key.ARROW_DOWN),
                             // 67
-                            'C' => return @intFromEnum(Key.arrow_right),
+                            'C' => return @intFromEnum(Key.ARROW_RIGHT),
                             // 68
-                            'D' => return @intFromEnum(Key.arrow_left),
+                            'D' => return @intFromEnum(Key.ARROW_LEFT),
+                            'H' => return @intFromEnum(Key.HOME),
+                            'F' => return @intFromEnum(Key.END),
+                            '0'...'9' => {
+                                _ = linux.read(linux.STDIN_FILENO, seq[3..4], 1);
+                                if (seq[3] == '~') {
+                                    switch (seq[2]) {
+                                        '1' => return @intFromEnum(Key.HOME),
+                                        '3' => return @intFromEnum(Key.DEL),
+                                        '4' => return @intFromEnum(Key.END),
+                                        '5' => return @intFromEnum(Key.PAGE_UP),
+                                        '6' => return @intFromEnum(Key.PAGE_DOWN),
+                                        '7' => return @intFromEnum(Key.HOME),
+                                        '8' => return @intFromEnum(Key.END),
+                                        else => {},
+                                    }
+                                }
+                            },
+                            else => {},
+                        }
+                    },
+                    'O' => {
+                        switch (seq[2]) {
+                            'H' => return @intFromEnum(Key.HOME),
+                            'F' => return @intFromEnum(Key.END),
                             else => {},
                         }
                     },
@@ -127,22 +156,33 @@ const Editor = struct {
                 }
             },
             else => {
-                return self.c[0];
+                return seq[0];
             },
         }
 
-        return self.c[0];
+        return seq[0];
     }
 
     fn processKeyPress(self: *Self) !void {
         const k = try self.readKey();
         switch (@as(Key, @enumFromInt(k))) {
-            .ctrl_q => {
+            .CTRL_Q => {
                 self.disableRawMode();
                 linux.exit(0);
             },
-            .arrow_up, .arrow_down, .arrow_left, .arrow_right => {
+            .ARROW_UP, .ARROW_DOWN, .ARROW_LEFT, .ARROW_RIGHT => {
                 try self.moveCursor(@as(Key, @enumFromInt(k)));
+            },
+            .HOME => {
+                self.cx = 0;
+            },
+            .END => {
+                self.cx = self.screencols - 1;
+            },
+            .PAGE_UP, .PAGE_DOWN => {
+                for (0..self.screenrows) |_| {
+                    try self.moveCursor(if (k == @intFromEnum(Key.PAGE_UP)) Key.ARROW_UP else Key.ARROW_DOWN);
+                }
             },
             else => {},
         }
@@ -160,7 +200,7 @@ const Editor = struct {
 
         // Draw cursor on (`cx`, `cy`) position
         var buf: [32]u8 = undefined;
-        _ = try std.fmt.bufPrint(&buf, "\x1b[{};{}H", .{ self.cx + 1, self.cy + 1 });
+        _ = try std.fmt.bufPrint(&buf, "\x1b[{};{}H", .{ self.cy + 1, self.cx + 1 });
         try ab.appendSlice(&buf);
 
         try ab.appendSlice("\x1b[?25h");
@@ -225,17 +265,17 @@ const Editor = struct {
 
     fn moveCursor(self: *Self, key: Key) !void {
         switch (key) {
-            .arrow_up => {
-                self.cx -= 1;
+            .ARROW_UP => {
+                if (self.cy != 0) self.cy -= 1;
             },
-            .arrow_down => {
-                self.cx += 1;
+            .ARROW_DOWN => {
+                if (self.cy != self.screenrows - 1) self.cy += 1;
             },
-            .arrow_right => {
-                self.cy += 1;
+            .ARROW_RIGHT => {
+                if (self.cx != self.screencols - 1) self.cx += 1;
             },
-            .arrow_left => {
-                self.cy -= 1;
+            .ARROW_LEFT => {
+                if (self.cx != 0) self.cx -= 1;
             },
             else => unreachable,
         }
