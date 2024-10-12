@@ -29,19 +29,24 @@ const Key = enum(u8) {
 const Editor = struct {
     const Self = @This();
 
-    allocator: mem.Allocator,
+    alloc: mem.Allocator,
     orig_termios: linux.termios = undefined,
-    screenrows: u16 = 0,
-    screencols: u16 = 0,
+    screen_rows: u16 = 0,
+    screen_cols: u16 = 0,
     cx: u16 = 0, // Horizontal coordinate of the cursor (the column)
     cy: u16 = 0, // Vertical coordinate of the cursor (the row)
+    rows: ArrayList([]u8), // Editor row of texts;
 
-    fn init(allocator: mem.Allocator) !Self {
-        return Self{ .allocator = allocator };
+    fn init(alloc: mem.Allocator) !Self {
+        return Self{ .alloc = alloc, .rows = ArrayList([]u8).init(alloc) };
     }
 
     fn deinit(self: *Self) void {
         self.disableRawMode();
+        for (self.rows.items) |row| {
+            self.alloc.free(row);
+        }
+        self.rows.deinit();
     }
 
     fn enableRawMode(self: *Self) !void {
@@ -105,8 +110,8 @@ const Editor = struct {
     }
 
     fn readKey(_: *Self) !u8 {
-        // var seq = try self.allocator.alloc(u8, 3);
-        // defer self.allocator.free(seq);
+        // var seq = try self.alloc.alloc(u8, 3);
+        // defer self.alloc.free(seq);
         var seq = [_]u8{0} ** 4;
         _ = linux.read(linux.STDIN_FILENO, seq[0..1], 1);
         switch (@as(Key, @enumFromInt(seq[0]))) {
@@ -177,10 +182,10 @@ const Editor = struct {
                 self.cx = 0;
             },
             .END => {
-                self.cx = self.screencols - 1;
+                self.cx = self.screen_cols - 1;
             },
             .PAGE_UP, .PAGE_DOWN => {
-                for (0..self.screenrows) |_| {
+                for (0..self.screen_rows) |_| {
                     try self.moveCursor(if (k == @intFromEnum(Key.PAGE_UP)) Key.ARROW_UP else Key.ARROW_DOWN);
                 }
             },
@@ -189,7 +194,7 @@ const Editor = struct {
     }
 
     fn refreshScreen(self: *Self) !void {
-        var ab = ArrayList(u8).init(self.allocator);
+        var ab = ArrayList(u8).init(self.alloc);
         defer ab.deinit();
         // Hide the cursor when repainting
         try ab.appendSlice("\x1b[?25l");
@@ -208,22 +213,27 @@ const Editor = struct {
     }
 
     fn drawRows(self: *Self, ab: *ArrayList(u8)) !void {
-        for (0..self.screenrows) |y| {
-            if (y == self.screencols / 3) {
-                var buf: [64]u8 = undefined;
-                const welcome = try std.fmt.bufPrint(&buf, "Zilo editor -- version {s}", .{ZILO_VERSION});
-                var padding = if (welcome.len > self.screencols) 0 else (self.screencols - welcome.len) / 2;
-                if (padding > 0) {
+        for (0..self.screen_rows) |y| {
+            if (y >= self.rows.items.len) {
+                if (self.rows.items.len == 0 and y == self.screen_cols / 3) {
+                    var buf: [64]u8 = undefined;
+                    const welcome = try std.fmt.bufPrint(&buf, "Zilo editor -- version {s}", .{ZILO_VERSION});
+                    var padding = if (welcome.len > self.screen_cols) 0 else (self.screen_cols - welcome.len) / 2;
+                    if (padding > 0) {
+                        try ab.appendSlice("~");
+                        padding -= 1;
+                    }
+                    for (0..padding) |_| try ab.appendSlice(" ");
+                    try ab.appendSlice(welcome);
+                } else {
                     try ab.appendSlice("~");
-                    padding -= 1;
                 }
-                for (0..padding) |_| try ab.appendSlice(" ");
-                try ab.appendSlice(welcome);
             } else {
-                try ab.appendSlice("~");
+                const max_line_len = @min(self.screen_cols, self.rows.items[y].len);
+                try ab.appendSlice(self.rows.items[y][0..max_line_len]);
             }
             try ab.appendSlice("\x1b[K");
-            if (y < self.screenrows - 1) {
+            if (y < self.screen_rows - 1) {
                 try ab.appendSlice("\r\n");
             }
         }
@@ -240,8 +250,8 @@ const Editor = struct {
             _ = linux.write(linux.STDOUT_FILENO, strn, strn.len);
             return try self.getCursorPosition();
         } else {
-            self.screenrows = winsize.row;
-            self.screencols = winsize.col;
+            self.screen_rows = winsize.row;
+            self.screen_cols = winsize.col;
         }
     }
 
@@ -259,8 +269,8 @@ const Editor = struct {
         if (buf[0] != '\x1b' or buf[1] != '[') return error.CursorError;
         // Format follows \x1b[24;98R
         var buf_iter = std.mem.tokenizeAny(u8, buf[2..i], ";");
-        self.screenrows = try std.fmt.parseInt(u16, buf_iter.next() orelse return error.InvalidFormat, 10);
-        self.screencols = try std.fmt.parseInt(u16, buf_iter.next() orelse return error.InvalidFormat, 10);
+        self.screen_rows = try std.fmt.parseInt(u16, buf_iter.next() orelse return error.InvalidFormat, 10);
+        self.screen_cols = try std.fmt.parseInt(u16, buf_iter.next() orelse return error.InvalidFormat, 10);
     }
 
     fn moveCursor(self: *Self, key: Key) !void {
@@ -269,10 +279,10 @@ const Editor = struct {
                 if (self.cy != 0) self.cy -= 1;
             },
             .ARROW_DOWN => {
-                if (self.cy != self.screenrows - 1) self.cy += 1;
+                if (self.cy != self.screen_rows - 1) self.cy += 1;
             },
             .ARROW_RIGHT => {
-                if (self.cx != self.screencols - 1) self.cx += 1;
+                if (self.cx != self.screen_cols - 1) self.cx += 1;
             },
             .ARROW_LEFT => {
                 if (self.cx != 0) self.cx -= 1;
@@ -280,15 +290,46 @@ const Editor = struct {
             else => unreachable,
         }
     }
+
+    fn open(self: *Self, filename: []const u8) !void {
+        var file = try std.fs.cwd().openFile(filename, .{});
+        defer file.close();
+
+        var file_reader = file.reader();
+        while (true) {
+            const line_bytes = file_reader.readUntilDelimiterOrEofAlloc(self.alloc, '\n', std.math.maxInt(usize)) catch |err| {
+                std.log.err("error reading file bytes: {}", .{err});
+                return;
+            };
+            if (line_bytes == null) {
+                break;
+            }
+            try self.appendRow(line_bytes.?);
+        }
+    }
+
+    fn appendRow(self: *Self, line: []u8) !void {
+        try self.rows.append(line);
+    }
 };
 
 pub fn main() !void {
-    var gpa_impl = std.heap.GeneralPurposeAllocator(.{}){};
-    const allocator = gpa_impl.allocator();
-    defer _ = gpa_impl.deinit();
+    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
+    defer _ = gpa.deinit();
 
-    var editor = try Editor.init(allocator);
+    const alloc = gpa.allocator();
+
+    const args = try std.process.argsAlloc(alloc);
+    defer std.process.argsFree(alloc, args);
+
+    var editor = try Editor.init(alloc);
     defer editor.deinit();
+    errdefer editor.deinit();
+
+    if (args.len >= 2) {
+        const filename = args[1];
+        try editor.open(filename);
+    }
 
     try editor.enableRawMode();
     // NOTE: Temporary
