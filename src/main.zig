@@ -35,6 +35,8 @@ const Editor = struct {
     screen_cols: u16 = 0,
     cx: u16 = 0, // Horizontal coordinate of the cursor (the column)
     cy: u16 = 0, // Vertical coordinate of the cursor (the row)
+    row_offset: u16 = 0, // Row of the file the user is currently scrolled to
+    col_offset: u16 = 0, // Column of the file the user is currently on
     rows: ArrayList([]u8), // Editor row of texts;
 
     fn init(alloc: mem.Allocator) !Self {
@@ -194,6 +196,7 @@ const Editor = struct {
     }
 
     fn refreshScreen(self: *Self) !void {
+        self.scroll();
         var ab = ArrayList(u8).init(self.alloc);
         defer ab.deinit();
         // Hide the cursor when repainting
@@ -205,7 +208,7 @@ const Editor = struct {
 
         // Draw cursor on (`cx`, `cy`) position
         var buf: [32]u8 = undefined;
-        _ = try std.fmt.bufPrint(&buf, "\x1b[{};{}H", .{ self.cy + 1, self.cx + 1 });
+        _ = try std.fmt.bufPrint(&buf, "\x1b[{};{}H", .{ (self.cy - self.row_offset) + 1, (self.cx - self.col_offset) + 1 });
         try ab.appendSlice(&buf);
 
         try ab.appendSlice("\x1b[?25h");
@@ -213,9 +216,14 @@ const Editor = struct {
     }
 
     fn drawRows(self: *Self, ab: *ArrayList(u8)) !void {
+        // number of text rows to draw
+        const num_text_rows = self.rows.items.len;
+        // iterate over screen rows
         for (0..self.screen_rows) |y| {
-            if (y >= self.rows.items.len) {
-                if (self.rows.items.len == 0 and y == self.screen_cols / 3) {
+            const file_row = y + self.row_offset;
+            // check if there are text rows to be drawn
+            if (file_row >= num_text_rows) {
+                if (num_text_rows == 0 and y == self.screen_cols / 3) {
                     var buf: [64]u8 = undefined;
                     const welcome = try std.fmt.bufPrint(&buf, "Zilo editor -- version {s}", .{ZILO_VERSION});
                     var padding = if (welcome.len > self.screen_cols) 0 else (self.screen_cols - welcome.len) / 2;
@@ -229,9 +237,12 @@ const Editor = struct {
                     try ab.appendSlice("~");
                 }
             } else {
-                const max_line_len = @min(self.screen_cols, self.rows.items[y].len);
-                try ab.appendSlice(self.rows.items[y][0..max_line_len]);
+                // draw text row
+                var line_len = self.rows.items[file_row].len - self.col_offset;
+                line_len = @min(@max(line_len, 0), self.screen_cols);
+                try ab.appendSlice(self.rows.items[file_row][0..line_len]);
             }
+
             try ab.appendSlice("\x1b[K");
             if (y < self.screen_rows - 1) {
                 try ab.appendSlice("\r\n");
@@ -274,20 +285,40 @@ const Editor = struct {
     }
 
     fn moveCursor(self: *Self, key: Key) !void {
+        const num_text_rows = self.rows.items.len;
+        var curr_row = if (self.cy < num_text_rows) self.rows.items[self.cy] else null;
         switch (key) {
             .ARROW_UP => {
                 if (self.cy != 0) self.cy -= 1;
             },
             .ARROW_DOWN => {
-                if (self.cy != self.screen_rows - 1) self.cy += 1;
+                if (self.cy < num_text_rows) self.cy += 1;
             },
             .ARROW_RIGHT => {
-                if (self.cx != self.screen_cols - 1) self.cx += 1;
+                if (curr_row != null and self.cx < curr_row.?.len) {
+                    self.cx += 1;
+                } else if (curr_row != null and self.cx == curr_row.?.len) {
+                    // move right at the end of a line
+                    self.cy += 1;
+                    self.cx = 0;
+                }
             },
             .ARROW_LEFT => {
-                if (self.cx != 0) self.cx -= 1;
+                if (self.cx != 0) {
+                    self.cx -= 1;
+                } else if (self.cy > 0) {
+                    // move left at the start of a line
+                    self.cy -= 1;
+                    self.cx = @as(u16, @intCast(self.rows.items[self.cy].len));
+                }
             },
             else => unreachable,
+        }
+
+        // snap cursor to the end of line
+        curr_row = if (self.cy < num_text_rows) self.rows.items[self.cy] else null;
+        if (curr_row) |value| {
+            self.cx = @min(self.cx, value.len);
         }
     }
 
@@ -311,6 +342,24 @@ const Editor = struct {
     fn appendRow(self: *Self, line: []u8) !void {
         try self.rows.append(line);
     }
+
+    fn scroll(self: *Self) void {
+        if (self.cy < self.row_offset) {
+            self.row_offset = self.cy;
+        }
+
+        if (self.cy >= self.row_offset + self.screen_rows) {
+            self.row_offset = self.cy - self.screen_rows + 1;
+        }
+
+        if (self.cx < self.col_offset) {
+            self.col_offset = self.cx;
+        }
+
+        if (self.cx >= self.col_offset + self.screen_cols) {
+            self.col_offset = self.cx - self.screen_cols + 1;
+        }
+    }
 };
 
 pub fn main() !void {
@@ -332,9 +381,8 @@ pub fn main() !void {
     }
 
     try editor.enableRawMode();
-    // NOTE: Temporary
-    try editor.getWindowSize();
     while (true) {
+        try editor.getWindowSize();
         try editor.refreshScreen();
         try editor.processKeyPress();
     }
