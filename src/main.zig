@@ -1,4 +1,5 @@
 const std = @import("std");
+const c = @cImport(@cInclude("time.h"));
 
 const io = std.io;
 const linux = std.os.linux;
@@ -6,11 +7,12 @@ const ascii = std.ascii;
 const mem = std.mem;
 const ArrayList = std.ArrayList;
 
-const STDIN = io.getStdIn().reader();
-const STDOUT = io.getStdOut().writer();
-
 const ZILO_VERSION = "0.0.1";
 const ZILO_TAB_STOP = 4;
+const DATETIME_FORMAT = "%a %d %b %Y %I:%M:%S %p %Z";
+
+const STDIN = io.getStdIn().reader();
+const STDOUT = io.getStdOut().writer();
 
 const Key = enum(u8) {
     CTRL_Q = 17,
@@ -49,14 +51,14 @@ const Row = struct {
 
     fn replaceTabs(self: *Self) !void {
         var tabs: u16 = 0;
-        for (self.line) |c| {
-            if (c == '\t') tabs += 1;
+        for (self.line) |char| {
+            if (char == '\t') tabs += 1;
         }
         var render = try self.alloc.alloc(u8, self.line.len + (tabs * (ZILO_TAB_STOP - 1)));
 
         var idx: u16 = 0;
-        for (self.line) |c| {
-            switch (c) {
+        for (self.line) |char| {
+            switch (char) {
                 '\t' => {
                     for (0..ZILO_TAB_STOP) |_| {
                         render[idx] = ' ';
@@ -64,7 +66,7 @@ const Row = struct {
                     }
                 },
                 else => {
-                    render[idx] = c;
+                    render[idx] = char;
                     idx += 1;
                 },
             }
@@ -73,8 +75,8 @@ const Row = struct {
     }
 
     fn rowCxToRx(self: *Self, cx: u16) u16 {
-        var idx: u16 = 0;
         var rx: u16 = 0;
+        var idx: u16 = 0;
         while (idx < cx) : (idx += 1) {
             if (self.line[idx] == '\t') {
                 rx += (ZILO_TAB_STOP - 1) - (rx % ZILO_TAB_STOP);
@@ -100,8 +102,16 @@ const Editor = struct {
     col_offset: u16 = 0, // Column of the file the user is currently on
     rows: ArrayList(Row), // Editor row of texts;
 
+    filename: []const u8 = "",
+    statusmsg: ArrayList(u8) = undefined,
+    statusmsg_time: c.time_t = undefined,
+
     fn init(alloc: mem.Allocator) !Self {
-        return Self{ .alloc = alloc, .rows = ArrayList(Row).init(alloc) };
+        return Self{
+            .alloc = alloc,
+            .rows = ArrayList(Row).init(alloc),
+            .statusmsg = ArrayList(u8).init(alloc),
+        };
     }
 
     // NOTE: Review function
@@ -269,25 +279,27 @@ const Editor = struct {
 
     fn refreshScreen(self: *Self) !void {
         self.scroll();
-        var ab = ArrayList(u8).init(self.alloc);
-        defer ab.deinit();
+        var abuf = ArrayList(u8).init(self.alloc);
+        defer abuf.deinit();
         // Hide the cursor when repainting
-        try ab.appendSlice("\x1b[?25l");
+        try abuf.appendSlice("\x1b[?25l");
         // Escape sequences always start with `Escape` (\x1b or 27) followed by `[`
         // H command, which is only 3 bytes long, puts the cursor at a certain position (1, 1) by default;
-        try ab.appendSlice("\x1b[H");
-        try self.drawRows(&ab);
+        try abuf.appendSlice("\x1b[H");
+        try self.drawRows(&abuf);
+        try self.drawStatusBar(&abuf);
+        try self.drawMessageBar(&abuf);
 
         // Draw cursor on (`rx`, `cy`) position
         var buf: [32]u8 = undefined;
         _ = try std.fmt.bufPrint(&buf, "\x1b[{};{}H", .{ (self.cy - self.row_offset) + 1, (self.rx - self.col_offset) + 1 });
-        try ab.appendSlice(&buf);
+        try abuf.appendSlice(&buf);
 
-        try ab.appendSlice("\x1b[?25h");
-        _ = linux.write(linux.STDOUT_FILENO, ab.items.ptr, ab.items.len);
+        try abuf.appendSlice("\x1b[?25h");
+        _ = linux.write(linux.STDOUT_FILENO, abuf.items.ptr, abuf.items.len);
     }
 
-    fn drawRows(self: *Self, ab: *ArrayList(u8)) !void {
+    fn drawRows(self: *Self, abuf: *ArrayList(u8)) !void {
         // number of text rows to draw
         const num_text_rows = self.rows.items.len;
         // iterate over screen rows
@@ -300,29 +312,30 @@ const Editor = struct {
                     const welcome = try std.fmt.bufPrint(&buf, "Zilo editor -- version {s}", .{ZILO_VERSION});
                     var padding = if (welcome.len > self.screen_cols) 0 else (self.screen_cols - welcome.len) / 2;
                     if (padding > 0) {
-                        try ab.appendSlice("~");
+                        try abuf.appendSlice("~");
                         padding -= 1;
                     }
-                    for (0..padding) |_| try ab.appendSlice(" ");
-                    try ab.appendSlice(welcome);
+                    for (0..padding) |_| try abuf.appendSlice(" ");
+                    try abuf.appendSlice(welcome);
                 } else {
-                    try ab.appendSlice("~");
+                    try abuf.appendSlice("~");
                 }
             } else {
                 // draw text row
                 var line_len = self.rows.items[file_row].render.len - self.col_offset;
                 line_len = @min(@max(line_len, 0), self.screen_cols);
-                try ab.appendSlice(self.rows.items[file_row].render[0..line_len]);
+                try abuf.appendSlice(self.rows.items[file_row].render[self.col_offset .. self.col_offset + line_len]);
             }
 
-            try ab.appendSlice("\x1b[K");
-            if (y < self.screen_rows - 1) {
-                try ab.appendSlice("\r\n");
-            }
+            try abuf.appendSlice("\x1b[K");
+            try abuf.appendSlice("\r\n");
         }
     }
 
     fn getWindowSize(self: *Self) !void {
+        defer {
+            self.screen_rows -= 2; // accomodate for status and messages bars
+        }
         var winsize: std.posix.winsize = undefined;
         if (linux.ioctl(
             linux.STDOUT_FILENO,
@@ -395,6 +408,7 @@ const Editor = struct {
     }
 
     fn open(self: *Self, filename: []const u8) !void {
+        self.filename = filename;
         var file = try std.fs.cwd().openFile(filename, .{});
         defer file.close();
 
@@ -439,13 +453,54 @@ const Editor = struct {
             self.col_offset = self.rx - self.screen_cols + 1;
         }
     }
+
+    fn drawStatusBar(self: *Self, abuf: *ArrayList(u8)) !void {
+        try abuf.appendSlice("\x1b[7m"); // switch to inverted colors
+
+        var buf: [128]u8 = undefined;
+        const status = try std.fmt.bufPrint(&buf, "{s:.20} - {d} lines", .{ if (self.filename.len > 0) self.filename else "[No Name]", self.rows.items.len });
+        try abuf.appendSlice(status[0..@min(status.len, self.screen_cols)]);
+
+        var rbuf: [128]u8 = undefined;
+        const rstatus = try std.fmt.bufPrint(&rbuf, "{d}/{d}", .{ self.cy + 1, self.rows.items.len });
+
+        var len = status.len;
+        while (len < self.screen_cols) {
+            if (self.screen_cols - len == rstatus.len) {
+                try abuf.appendSlice(rstatus);
+                break;
+            } else {
+                try abuf.append(' ');
+                len += 1;
+            }
+        }
+        try abuf.appendSlice("\x1b[m"); // reset color switch
+        try abuf.appendSlice("\r\n");
+    }
+
+    fn setStatusMessage(self: *Self, comptime fmt: []const u8, args: anytype) !void {
+        var buf: [128]u8 = undefined;
+        _ = try std.fmt.bufPrint(&buf, fmt, args);
+        try self.statusmsg.appendSlice(&buf);
+
+        self.statusmsg_time = c.time(null);
+    }
+
+    fn drawMessageBar(self: *Self, abuf: *ArrayList(u8)) !void {
+        try abuf.appendSlice("\x1b[K");
+        const msg_len: u16 = @min(self.statusmsg.items.len, self.screen_cols);
+        if (msg_len > 0 and c.time(null) - self.statusmsg_time < 5) {
+            try abuf.appendSlice(self.statusmsg.items[0..msg_len]);
+        }
+    }
 };
 
 pub fn main() !void {
     var gpa = std.heap.GeneralPurposeAllocator(.{}){};
     defer _ = gpa.deinit();
-
     const alloc = gpa.allocator();
+
+    // logging.setup(alloc);
 
     const args = try std.process.argsAlloc(alloc);
     defer std.process.argsFree(alloc, args);
@@ -454,10 +509,15 @@ pub fn main() !void {
     defer editor.deinit();
     errdefer editor.deinit();
 
+    // Get initial window size;
+    try editor.getWindowSize();
+
     if (args.len >= 2) {
         const filename = args[1];
         try editor.open(filename);
     }
+
+    try editor.setStatusMessage("HELP - Ctrl-Q = quit", .{});
 
     try editor.enableRawMode();
     while (true) {
