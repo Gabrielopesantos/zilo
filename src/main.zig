@@ -10,6 +10,7 @@ const STDIN = io.getStdIn().reader();
 const STDOUT = io.getStdOut().writer();
 
 const ZILO_VERSION = "0.0.1";
+const ZILO_TAB_STOP = 4;
 
 const Key = enum(u8) {
     CTRL_Q = 17,
@@ -26,6 +27,65 @@ const Key = enum(u8) {
     _,
 };
 
+const Row = struct {
+    const Self = @This();
+
+    alloc: mem.Allocator,
+    line: []u8,
+    render: []u8,
+
+    fn init(alloc: mem.Allocator, line: []u8) Self {
+        return .{
+            .alloc = alloc,
+            .line = line,
+            .render = undefined,
+        };
+    }
+
+    fn deinit(self: *Self) void {
+        self.alloc.free(self.line);
+        self.alloc.free(self.render);
+    }
+
+    fn replaceTabs(self: *Self) !void {
+        var tabs: u16 = 0;
+        for (self.line) |c| {
+            if (c == '\t') tabs += 1;
+        }
+        var render = try self.alloc.alloc(u8, self.line.len + (tabs * (ZILO_TAB_STOP - 1)));
+
+        var idx: u16 = 0;
+        for (self.line) |c| {
+            switch (c) {
+                '\t' => {
+                    for (0..ZILO_TAB_STOP) |_| {
+                        render[idx] = ' ';
+                        idx += 1;
+                    }
+                },
+                else => {
+                    render[idx] = c;
+                    idx += 1;
+                },
+            }
+        }
+        self.render = render;
+    }
+
+    fn rowCxToRx(self: *Self, cx: u16) u16 {
+        var idx: u16 = 0;
+        var rx: u16 = 0;
+        while (idx < cx) : (idx += 1) {
+            if (self.line[idx] == '\t') {
+                rx += (ZILO_TAB_STOP - 1) - (rx % ZILO_TAB_STOP);
+            }
+            rx += 1;
+        }
+
+        return rx;
+    }
+};
+
 const Editor = struct {
     const Self = @This();
 
@@ -35,18 +95,20 @@ const Editor = struct {
     screen_cols: u16 = 0,
     cx: u16 = 0, // Horizontal coordinate of the cursor (the column)
     cy: u16 = 0, // Vertical coordinate of the cursor (the row)
+    rx: u16 = 0, // // Index into the `render` field
     row_offset: u16 = 0, // Row of the file the user is currently scrolled to
     col_offset: u16 = 0, // Column of the file the user is currently on
-    rows: ArrayList([]u8), // Editor row of texts;
+    rows: ArrayList(Row), // Editor row of texts;
 
     fn init(alloc: mem.Allocator) !Self {
-        return Self{ .alloc = alloc, .rows = ArrayList([]u8).init(alloc) };
+        return Self{ .alloc = alloc, .rows = ArrayList(Row).init(alloc) };
     }
 
+    // NOTE: Review function
     fn deinit(self: *Self) void {
         self.disableRawMode();
-        for (self.rows.items) |row| {
-            self.alloc.free(row);
+        for (0..self.rows.items.len) |i| {
+            self.rows.items[i].deinit();
         }
         self.rows.deinit();
     }
@@ -172,6 +234,7 @@ const Editor = struct {
 
     fn processKeyPress(self: *Self) !void {
         const k = try self.readKey();
+        const num_text_rows = self.rows.items.len;
         switch (@as(Key, @enumFromInt(k))) {
             .CTRL_Q => {
                 self.disableRawMode();
@@ -184,11 +247,20 @@ const Editor = struct {
                 self.cx = 0;
             },
             .END => {
-                self.cx = self.screen_cols - 1;
+                if (self.cy < num_text_rows) {
+                    self.cx = @as(u16, @intCast(self.rows.items[self.cy].line.len));
+                }
             },
             .PAGE_UP, .PAGE_DOWN => {
+                const isPageUp = k == @intFromEnum(Key.PAGE_UP);
+                if (isPageUp) {
+                    self.cy = self.row_offset;
+                } else { // page down
+                    self.cy = @min(self.row_offset + self.screen_rows - 1, num_text_rows);
+                }
+
                 for (0..self.screen_rows) |_| {
-                    try self.moveCursor(if (k == @intFromEnum(Key.PAGE_UP)) Key.ARROW_UP else Key.ARROW_DOWN);
+                    try self.moveCursor(if (isPageUp) Key.ARROW_UP else Key.ARROW_DOWN);
                 }
             },
             else => {},
@@ -206,9 +278,9 @@ const Editor = struct {
         try ab.appendSlice("\x1b[H");
         try self.drawRows(&ab);
 
-        // Draw cursor on (`cx`, `cy`) position
+        // Draw cursor on (`rx`, `cy`) position
         var buf: [32]u8 = undefined;
-        _ = try std.fmt.bufPrint(&buf, "\x1b[{};{}H", .{ (self.cy - self.row_offset) + 1, (self.cx - self.col_offset) + 1 });
+        _ = try std.fmt.bufPrint(&buf, "\x1b[{};{}H", .{ (self.cy - self.row_offset) + 1, (self.rx - self.col_offset) + 1 });
         try ab.appendSlice(&buf);
 
         try ab.appendSlice("\x1b[?25h");
@@ -238,9 +310,9 @@ const Editor = struct {
                 }
             } else {
                 // draw text row
-                var line_len = self.rows.items[file_row].len - self.col_offset;
+                var line_len = self.rows.items[file_row].render.len - self.col_offset;
                 line_len = @min(@max(line_len, 0), self.screen_cols);
-                try ab.appendSlice(self.rows.items[file_row][0..line_len]);
+                try ab.appendSlice(self.rows.items[file_row].render[0..line_len]);
             }
 
             try ab.appendSlice("\x1b[K");
@@ -295,9 +367,9 @@ const Editor = struct {
                 if (self.cy < num_text_rows) self.cy += 1;
             },
             .ARROW_RIGHT => {
-                if (curr_row != null and self.cx < curr_row.?.len) {
+                if (curr_row != null and self.cx < curr_row.?.line.len) {
                     self.cx += 1;
-                } else if (curr_row != null and self.cx == curr_row.?.len) {
+                } else if (curr_row != null and self.cx == curr_row.?.line.len) {
                     // move right at the end of a line
                     self.cy += 1;
                     self.cx = 0;
@@ -309,7 +381,7 @@ const Editor = struct {
                 } else if (self.cy > 0) {
                     // move left at the start of a line
                     self.cy -= 1;
-                    self.cx = @as(u16, @intCast(self.rows.items[self.cy].len));
+                    self.cx = @as(u16, @intCast(self.rows.items[self.cy].line.len));
                 }
             },
             else => unreachable,
@@ -318,7 +390,7 @@ const Editor = struct {
         // snap cursor to the end of line
         curr_row = if (self.cy < num_text_rows) self.rows.items[self.cy] else null;
         if (curr_row) |value| {
-            self.cx = @min(self.cx, value.len);
+            self.cx = @min(self.cx, value.line.len);
         }
     }
 
@@ -340,10 +412,17 @@ const Editor = struct {
     }
 
     fn appendRow(self: *Self, line: []u8) !void {
-        try self.rows.append(line);
+        var row = Row.init(self.alloc, line);
+        try row.replaceTabs();
+        try self.rows.append(row);
     }
 
     fn scroll(self: *Self) void {
+        self.rx = 0;
+        if (self.cy < self.rows.items.len) {
+            self.rx = self.rows.items[self.cy].rowCxToRx(self.cx);
+        }
+
         if (self.cy < self.row_offset) {
             self.row_offset = self.cy;
         }
@@ -352,12 +431,12 @@ const Editor = struct {
             self.row_offset = self.cy - self.screen_rows + 1;
         }
 
-        if (self.cx < self.col_offset) {
-            self.col_offset = self.cx;
+        if (self.rx < self.col_offset) {
+            self.col_offset = self.rx;
         }
 
-        if (self.cx >= self.col_offset + self.screen_cols) {
-            self.col_offset = self.cx - self.screen_cols + 1;
+        if (self.rx >= self.col_offset + self.screen_cols) {
+            self.col_offset = self.rx - self.screen_cols + 1;
         }
     }
 };
