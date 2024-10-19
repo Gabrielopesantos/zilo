@@ -321,10 +321,15 @@ const Editor = struct {
                     try abuf.appendSlice("~");
                 }
             } else {
-                // draw text row
-                var line_len = self.rows.items[file_row].render.len - self.col_offset;
-                line_len = @min(@max(line_len, 0), self.screen_cols);
-                try abuf.appendSlice(self.rows.items[file_row].render[self.col_offset .. self.col_offset + line_len]);
+                // check if row text length is less than the col offset, if so draw the line
+                const row = self.rows.items[file_row];
+                if (self.col_offset < row.render.len) {
+                    var line_len = row.render.len - self.col_offset;
+                    line_len = @min(line_len, self.screen_cols);
+                    if (line_len > 0) {
+                        try abuf.appendSlice(row.render[self.col_offset .. self.col_offset + line_len]);
+                    }
+                }
             }
 
             try abuf.appendSlice("\x1b[K");
