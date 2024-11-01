@@ -15,8 +15,14 @@ const STDIN = io.getStdIn().reader();
 const STDOUT = io.getStdOut().writer();
 
 const Key = enum(u8) {
+    NULL = 0,
+    CTRL_H = 8,
+    CTRL_L = 12,
+    CR = 13,
     CTRL_Q = 17,
+    CTRL_S = 19,
     ESC = 27,
+    BACKSPACE = 127,
     ARROW_UP = 128,
     ARROW_DOWN,
     ARROW_RIGHT,
@@ -246,10 +252,16 @@ const Editor = struct {
         const k = try self.readKey();
         const num_text_rows = self.rows.items.len;
         switch (@as(Key, @enumFromInt(k))) {
+            // NOTE: Ignore 'null' so `insertChar` isn't invoked when `read` times out
+            .NULL => {},
+            .CR => {
+                //TODO
+            },
             .CTRL_Q => {
                 self.disableRawMode();
                 linux.exit(0);
             },
+            .CTRL_S => try self.save(),
             .ARROW_UP, .ARROW_DOWN, .ARROW_LEFT, .ARROW_RIGHT => {
                 try self.moveCursor(@as(Key, @enumFromInt(k)));
             },
@@ -260,6 +272,9 @@ const Editor = struct {
                 if (self.cy < num_text_rows) {
                     self.cx = @as(u16, @intCast(self.rows.items[self.cy].line.len));
                 }
+            },
+            .BACKSPACE, .DEL, .CTRL_H => {
+                //TODO
             },
             .PAGE_UP, .PAGE_DOWN => {
                 const isPageUp = k == @intFromEnum(Key.PAGE_UP);
@@ -273,7 +288,8 @@ const Editor = struct {
                     try self.moveCursor(if (isPageUp) Key.ARROW_UP else Key.ARROW_DOWN);
                 }
             },
-            else => {},
+            .CTRL_L, .ESC => {},
+            else => try self.insertChar(k),
         }
     }
 
@@ -484,9 +500,13 @@ const Editor = struct {
     }
 
     fn setStatusMessage(self: *Self, comptime fmt: []const u8, args: anytype) !void {
-        var buf: [128]u8 = undefined;
-        _ = try std.fmt.bufPrint(&buf, fmt, args);
-        try self.statusmsg.appendSlice(&buf);
+        self.statusmsg.clearRetainingCapacity();
+        //
+        // var buf: [128]u8 = undefined;
+        // _ = try std.fmt.bufPrint(&buf, fmt, args);
+        const buf = try std.fmt.allocPrint(self.alloc, fmt, args);
+
+        try self.statusmsg.appendSlice(buf);
 
         self.statusmsg_time = c.time(null);
     }
@@ -497,6 +517,83 @@ const Editor = struct {
         if (msg_len > 0 and c.time(null) - self.statusmsg_time < 5) {
             try abuf.appendSlice(self.statusmsg.items[0..msg_len]);
         }
+    }
+
+    fn rowInsertChar(self: *Self, row: *Row, at: usize, char: u8) !void {
+        const old_line = try self.alloc.dupe(u8, row.line);
+        row.line = try self.alloc.realloc(row.line, old_line.len + 1);
+        if (at > row.line.len) {
+            @memset(row.line[at .. at + 1], char);
+        } else {
+            var j: usize = 0;
+            for (0..row.line.len) |i| {
+                if (i == at) {
+                    row.line[i] = char;
+                } else {
+                    row.line[i] = old_line[j];
+                    j += 1;
+                }
+            }
+        }
+
+        try self.updateRow(row);
+    }
+
+    // NOTE: Shouldn't this be a row function?
+    fn updateRow(self: *Self, row: *Row) !void {
+        self.alloc.free(row.render);
+        // row.render = try self.alloc.dupe(u8, row.line);
+        try row.replaceTabs();
+    }
+
+    fn insertChar(self: *Self, char: u8) !void {
+        if (self.cy == self.rows.items.len) {
+            try self.appendRow("");
+        }
+        try self.rowInsertChar(&self.rows.items[self.cy], self.cx, char);
+        self.cx += 1;
+    }
+
+    // converts all text rows into a buffer
+    fn rowsToString(self: *Self) ![]u8 {
+        var buf_len: usize = 0;
+        for (self.rows.items) |row| {
+            buf_len += row.line.len + 1;
+        }
+        var buf = try self.alloc.alloc(u8, buf_len);
+        var pos: usize = 0;
+        for (self.rows.items) |row| {
+            @memcpy(buf[pos .. pos + row.line.len], row.line);
+            pos += row.line.len;
+            @memset(buf[pos .. pos + 1], '\n');
+            pos += 1;
+        }
+
+        return buf;
+    }
+
+    // save the current file on disk
+    fn save(self: *Self) !void {
+        if (self.filename.len == 0) return;
+
+        const buf = try self.rowsToString();
+        defer self.alloc.free(buf);
+
+        var file = try std.fs.cwd().createFile(
+            self.filename,
+            .{
+                .read = true,
+                .truncate = true,
+            },
+        );
+        file.writeAll(buf) catch |err| {
+            try self.setStatusMessage("Can't save! I/O error", .{});
+            return err;
+        };
+        defer file.close();
+
+        try self.setStatusMessage("{d} bytes written to disk", .{buf.len});
+        return;
     }
 };
 
@@ -522,7 +619,7 @@ pub fn main() !void {
         try editor.open(filename);
     }
 
-    try editor.setStatusMessage("HELP - Ctrl-Q = quit", .{});
+    try editor.setStatusMessage("HELP: Ctrl-S = save | Ctrl-Q = quit", .{});
 
     try editor.enableRawMode();
     while (true) {
